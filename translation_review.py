@@ -783,6 +783,7 @@ PAGE = r"""<!doctype html>
   tbody tr:hover td { background: var(--hl); }
   tr.done td { opacity: .55; }
   tr.done td.chk { opacity: 1; }
+  td.num .same { display: block; margin-top: 2px; font-size: 10px; color: var(--muted); }
   /* 前の版との差分 */
   .difftools { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
   .difftools label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
@@ -953,7 +954,7 @@ async function api(url, opts = {}) {
 }
 
 let words = store.get('words', {});       // key(lower) -> {word, note, ej, added}
-let done = store.get('done', {});         // hash -> true
+let done = store.get('done', {});         // hash -> true（左右が同じ段落を外したときは false）
 let currentWord = null;
 
 // ---------- 入力 ----------
@@ -1025,15 +1026,18 @@ function render() {
   for (let i = 0; i < n; i++) {
     const j = ja[i] ?? '', e = en[i] ?? '';
     const h = hash(j + '\u0000' + e);
+    // 参考文献や表の数値のように左右が完全に同じ段落は、最初から確認済みにする
+    const same = j !== '' && j.replace(/\s+/g, ' ') === e.replace(/\s+/g, ' ');
+    const ok = done[h] ?? same;
     const cj = diffCell(aj, i, j, plain), ce = diffCell(ae, i, e, wrapWords);
     const changed = cj.changed || ce.changed;
     if (changed) nChanged++;
-    const cls = [done[h] ? 'done' : '', changed ? 'changed' : '', useDiff && onlyChanged && !changed ? 'filtered' : ''].join(' ');
-    html += `<tr data-h="${h}" class="${cls}">
-      <td class="num">${i + 1}</td>
+    const cls = [ok ? 'done' : '', changed ? 'changed' : '', useDiff && onlyChanged && !changed ? 'filtered' : ''].join(' ');
+    html += `<tr data-h="${h}"${same ? ' data-same="1"' : ''} class="${cls}">
+      <td class="num">${i + 1}${same ? '<span class="same" title="左右が同じなので最初から確認済みにしています">同一</span>' : ''}</td>
       <td class="ja">${cj.html}</td>
       <td class="en">${ce.html}</td>
-      <td class="chk"><input type="checkbox" ${done[h] ? 'checked' : ''}></td></tr>`;
+      <td class="chk"><input type="checkbox" ${ok ? 'checked' : ''}></td></tr>`;
   }
   tb.innerHTML = html;
   if (useDiff) $('#diffInfo').textContent = `${base.time} の版から ${nChanged} 段落に変更があります`;
@@ -1131,14 +1135,16 @@ function updateStatus(nj, ne, n) {
   if (nj !== ne) { s.textContent = `⚠ 段落数が一致しません（日本語 ${nj} / 英語 ${ne}）`; s.className = 'status warn'; }
   else { s.textContent = n ? `${n} 段落` : ''; s.className = 'status'; }
   const rows = [...document.querySelectorAll('#rows tr[data-h]')];
-  const c = rows.filter(r => done[r.dataset.h]).length;
+  const c = rows.filter(r => r.querySelector('td.chk input').checked).length;
   $('#prog').style.width = rows.length ? (100 * c / rows.length) + '%' : '0';
   $('#progText').textContent = rows.length ? `${c} / ${rows.length} 段落を確認済み` : '—';
 }
 $('#rows').addEventListener('change', e => {
   if (e.target.type !== 'checkbox') return;
   const tr = e.target.closest('tr'); const h = tr.dataset.h;
-  if (e.target.checked) done[h] = true; else delete done[h];
+  if (e.target.checked) done[h] = true;
+  else if (tr.dataset.same) done[h] = false;   // 外したことを覚えておかないと、次の表示で自動チェックに戻ってしまう
+  else delete done[h];
   tr.classList.toggle('done', e.target.checked);
   store.set('done', done);
   updateStatus(...countParas());

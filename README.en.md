@@ -64,6 +64,8 @@ After that it is read from disk, so English–Japanese lookups work offline.
    - A warning appears in the header if the paragraph counts differ.
    - Switch the split mode (分割) to "1行ずつ" to pair line by line instead of by paragraph.
    - Tick the checkbox on the right to mark a paragraph as reviewed; progress is shown in the sidebar.
+   - Paragraphs that are identical on both sides (references, table values, etc.) are ticked from the start and
+     marked "同一" (identical) under the row number; differences in whitespace are ignored. If you untick one, it stays unticked.
 3. **Look up words**
    - **Click** an English word to open the dictionary; click the same word again to close it.
    - **Drag to select** a phrase (up to 6 words), then press the "辞書で調べる" button that appears. Selecting alone sends nothing.
