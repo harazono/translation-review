@@ -19,9 +19,12 @@ Google ドキュメントから原稿を読み込む機能を使う場合のみ�
 
 import argparse
 import functools
+import hmac
 import json
 import os
 import re
+import secrets
+import shutil
 import ssl
 import subprocess
 import sys
@@ -40,7 +43,12 @@ EJDICT_DIR = BASE_DIR / "ejdict"
 EJDICT_URL = "https://raw.githubusercontent.com/kujirahand/EJDict/master/src/{}.txt"
 FREEDICT_URL = "https://api.dictionaryapi.dev/api/v2/entries/en/{}"
 CREDENTIALS_FILE = BASE_DIR / "credentials.json"
-TOKEN_FILE = BASE_DIR / "token.json"
+# Google のログイン情報は、プロジェクトのフォルダ (外付けドライブや同期フォルダのことがある) ではなく、
+# ホームの設定フォルダに置く。外付けドライブはファイルの権限を無視する設定のことが多いため
+CONFIG_DIR = Path.home() / ".config" / "translation-review"
+TOKEN_FILE = CONFIG_DIR / "token.json"
+OLD_TOKEN_FILE = BASE_DIR / "token.json"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 DRIVE_API = "https://www.googleapis.com/drive/v3/files/"
 
@@ -58,7 +66,8 @@ def fetch(url, timeout=10):
     except (urllib.error.URLError, ssl.SSLError) as e:
         if "CERTIFICATE" not in str(e).upper():
             raise
-        out = subprocess.run(["curl", "-sfL", "--max-time", str(timeout), url],
+        out = subprocess.run(["curl", "-sfL", "--proto", "=https", "--proto-redir", "=https",
+                              "--max-time", str(timeout), url],
                              capture_output=True, check=True)
         return out.stdout
 
@@ -165,7 +174,7 @@ def lookup_english(word):
 EJ = EJDict()
 
 
-def lookup(query):
+def lookup(query, online=True):
     q = re.sub(r"\s+", " ", query.strip())
     res = {"query": q, "ej": [], "en": None, "headword": q, "dict_ready": EJ.ready}
     # 熟語ならそのまま、単語なら原形候補も順に試す
@@ -176,6 +185,9 @@ def lookup(query):
             res["headword"] = c
             res["ej"] = [{"headword": c, "meanings": [s.strip() for s in m.split(" / ")]} for m in hits]
             break
+    if not online:  # 英英辞書 (外部サービス) を使わない設定のときは英和辞書だけ
+        res["en"] = {"phonetic": "", "meanings": [], "offline": True}
+        return res
     en_word = res["headword"] if res["ej"] else (cands[0] if cands else q)
     res["en"] = lookup_english(en_word)
     if not res["en"]["meanings"] and " " not in q:
@@ -242,8 +254,47 @@ def load_credentials():
 
 
 def save_credentials(creds):
-    TOKEN_FILE.write_text(creds.to_json())
-    os.chmod(TOKEN_FILE, 0o600)
+    # 最初から本人だけが読める権限 (600) で作る (書いた後に chmod すると一瞬だけ他人が読める)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    tmp = TOKEN_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(creds.to_json())
+    os.replace(tmp, TOKEN_FILE)
+
+
+def migrate_old_token():
+    """以前の版がプロジェクトのフォルダに置いた token.json をホームの設定フォルダへ移す。"""
+    if not OLD_TOKEN_FILE.exists():
+        return
+    if not TOKEN_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(CONFIG_DIR, 0o700)
+        shutil.copyfile(OLD_TOKEN_FILE, TOKEN_FILE)
+        os.chmod(TOKEN_FILE, 0o600)
+    OLD_TOKEN_FILE.unlink()
+    print(f"Google のログイン情報を {TOKEN_FILE} に移しました。", flush=True)
+
+
+def drive_logout():
+    """Google 側で許可を取り消し、保存しているログイン情報を削除する。"""
+    revoked = False
+    if TOKEN_FILE.exists():
+        try:
+            data = json.loads(TOKEN_FILE.read_text())
+            token = data.get("refresh_token") or data.get("token")
+            if token:
+                req = urllib.request.Request(REVOKE_URL, data=urllib.parse.urlencode({"token": token}).encode(),
+                                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+                with urllib.request.urlopen(req, timeout=15):
+                    revoked = True
+        except urllib.error.HTTPError as e:
+            revoked = e.code == 400  # すでに無効なトークン
+        except Exception:  # noqa: BLE001
+            revoked = False
+        TOKEN_FILE.unlink(missing_ok=True)
+    return {"revoked": revoked}
 
 
 # ログインは「画面のリンク → Google の同意画面 → このサーバーの / に code 付きで戻る」流れ。
@@ -575,11 +626,24 @@ class Handler(BaseHTTPRequestHandler):
         host = urllib.parse.urlparse(origin).netloc
         return host in allowed if allowed is not None else host == self.headers.get("Host", "")
 
+    def _key_ok(self):
+        """API はアクセスキー (起動ごとに生成) を持つページからしか使えない。
+        同じ PC の他のユーザーやプログラムが localhost 経由でログイン済みの Drive を読むのを防ぐ。"""
+        return hmac.compare_digest(self.headers.get("X-Access-Key", ""), self.server.access_key)
+
+    def _deny_key(self):
+        self._send(403, json.dumps({"error": "アクセスキーが無効です。サーバー起動時にターミナルに表示された URL から開き直してください。",
+                                    "need_key": True}, ensure_ascii=False).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
     def do_GET(self):
         if not self._host_allowed():
             self._send(403, b"forbidden", "text/plain")
             return
         url = urllib.parse.urlparse(self.path)
+        if url.path.startswith("/api/") and not self._key_ok():
+            self._deny_key()
+            return
         params = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         if url.path == "/" and ("code" in params or "error" in params):
             self._oauth_callback(params)
@@ -590,7 +654,7 @@ class Handler(BaseHTTPRequestHandler):
             if not q.strip():
                 self._send(400, b'{"error":"empty"}', "application/json")
                 return
-            self._json(lookup(q))
+            self._json(lookup(q, online=params.get("online") != "0"))
         elif url.path == "/api/doi":
             try:
                 self._json(lookup_doi(params.get("doi", "")))
@@ -604,7 +668,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
-        if self.path != "/api/drive/fetch":
+        if self.path not in ("/api/drive/fetch", "/api/drive/logout"):
             self._send(404, b"not found", "text/plain")
             return
         # application/json を必須にすると、他サイトからの送信には CORS のプリフライトが必要になり、ここに届かない
@@ -612,9 +676,17 @@ class Handler(BaseHTTPRequestHandler):
                 or not self.headers.get("Content-Type", "").startswith("application/json")):
             self._send(403, b"forbidden", "text/plain")
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > MAX_BODY:
-            self._send(413, b"too large", "text/plain")
+        if not self._key_ok():
+            self._deny_key()
+            return
+        length_str = self.headers.get("Content-Length") or "0"
+        if not length_str.isdigit() or int(length_str) > MAX_BODY:
+            self._send(413, b"invalid or too large body", "text/plain")
+            return
+        length = int(length_str)
+        if self.path == "/api/drive/logout":
+            with _drive_lock:
+                self._json(drive_logout())
             return
         try:
             body = json.loads(self.rfile.read(length) or b"{}")
@@ -691,6 +763,9 @@ PAGE = r"""<!doctype html>
   .drive input { font: inherit; font-size: 13px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
   .drive .note { grid-column: 1 / -1; }
   .btn:disabled { opacity: .5; cursor: wait; }
+  .keybanner { background: var(--hl); color: var(--warn); padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  #selBtn { position: absolute; z-index: 40; display: none; font-size: 12px; padding: 3px 10px; }
+  .setting { display: flex; gap: 6px; align-items: flex-start; font-size: 12px; color: var(--muted); margin-top: 8px; }
   header { flex-wrap: nowrap; white-space: nowrap; }
   #driveMsg { flex: 0 1 380px; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .drive .note.warn { color: var(--warn); }
@@ -793,6 +868,7 @@ PAGE = r"""<!doctype html>
   <button class="btn hidden" id="driveReload" title="入力欄の URL から両方の原稿を取り直します">↻ Drive から再読み込み</button>
   <input id="search" type="search" placeholder="英単語を検索…" size="16">
 </header>
+<div id="keyError" class="keybanner hidden"></div>
 <main>
   <div id="content">
     <section id="tab-input">
@@ -840,7 +916,9 @@ PAGE = r"""<!doctype html>
   </div>
   <aside>
     <h2>使い方</h2>
-    <div class="small">英文の単語を<b>クリック</b>すると辞書が開き、もう一度クリックすると閉じます。熟語は<b>ドラッグ選択</b>で引けます。下線付きの単語は単語帳に登録済みです。</div>
+    <div class="small">英文の単語を<b>クリック</b>すると辞書が開き、もう一度クリックすると閉じます。熟語は<b>ドラッグで選択</b>して「辞書で調べる」を押します。下線付きの単語は単語帳に登録済みです。</div>
+    <label class="setting"><input type="checkbox" id="onlineDict">
+      <span>英英辞書（オンライン）も使う — 調べた単語・熟語が外部サービス dictionaryapi.dev に送信されます。オフにすると英和辞書だけをこの PC 内で引きます。</span></label>
     <h2>レビュー進捗</h2>
     <div class="progress"><div id="prog"></div></div>
     <div class="small" id="progText"></div>
@@ -851,6 +929,7 @@ PAGE = r"""<!doctype html>
 </main>
 
 <div id="pop"></div>
+<button class="btn primary" id="selBtn">辞書で調べる</button>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -859,6 +938,19 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('tr_' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem('tr_' + k, JSON.stringify(v)); } catch {} },
 };
+
+// ---------- アクセスキー ----------
+// サーバーは起動ごとにキーを発行して URL の #key=… で渡す。API はこのキーがないと使えない
+(() => {
+  const m = location.hash.match(/key=([\w-]+)/);
+  if (m) { store.set('key', m[1]); history.replaceState(null, '', location.pathname); }
+})();
+async function api(url, opts = {}) {
+  const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), 'X-Access-Key': store.get('key', '') } });
+  const d = await r.json();
+  if (d.need_key) { $('#keyError').textContent = '⚠ ' + d.error; $('#keyError').classList.remove('hidden'); }
+  return d;
+}
 
 let words = store.get('words', {});       // key(lower) -> {word, note, ej, added}
 let done = store.get('done', {});         // hash -> true
@@ -1073,8 +1165,13 @@ for (const area of [$('#rows'), $('#paper')]) {
       const sel = window.getSelection(); const t = sel.toString().trim();
       if (!t || sel.isCollapsed || e.detail > 1) return;
       if (!/^[A-Za-z][A-Za-z'’\- ]*$/.test(t) || t.split(/\s+/).length > 6) return;
+      // 選択しただけでは外部に送らない (コピーのための選択で原稿が送信されないように)
       const r = sel.getRangeAt(0).getBoundingClientRect();
-      lookup(t, null, r);
+      const b = $('#selBtn');
+      b.style.left = (r.left + window.scrollX) + 'px';
+      b.style.top = (r.bottom + window.scrollY + 4) + 'px';
+      b.style.display = 'block';
+      b.onclick = () => { b.style.display = 'none'; lookup(t, null, r); };
     }, 0);
   });
 }
@@ -1091,8 +1188,8 @@ async function lookup(q, anchor, rect) {
   pop.innerHTML = `<div class="head"><b>${esc(q)}</b><button class="close" onclick="hidePop()">×</button></div><div class="small">検索中…</div>`;
   pop.style.display = 'block';
   try {
-    const r = await fetch('/api/lookup?q=' + encodeURIComponent(q));
-    const d = await r.json();
+    const d = await api('/api/lookup?q=' + encodeURIComponent(q) + (store.get('online', true) ? '' : '&online=0'));
+    if (d.error) { pop.innerHTML += `<div class="small">${esc(d.error)}</div>`; return; }
     currentWord = d;
     renderPop(d);
   } catch (err) {
@@ -1120,7 +1217,8 @@ function renderPop(d) {
         `<li>${esc(x.def)}${x.example ? `<div class="ex">“${esc(x.example)}”</div>` : ''}</li>`).join('') + '</ol>';
       if (m.synonyms.length) h += `<div class="small">類義語: ${m.synonyms.map(esc).join(', ')}</div>`;
     }
-  } else h += `<div class="small">${d.en && d.en.error ? '取得エラー: ' + esc(d.en.error) : '見つかりませんでした'}</div>`;
+  } else h += `<div class="small">${d.en && d.en.offline ? 'オフ（右の設定で、外部に送信しない設定になっています）'
+    : d.en && d.en.error ? '取得エラー: ' + esc(d.en.error) : '見つかりませんでした'}</div>`;
 
   const qq = encodeURIComponent(d.query);
   h += `<div class="links">
@@ -1156,6 +1254,7 @@ function hidePop() {
 }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hidePop(); });
 document.addEventListener('mousedown', e => {
+  if (!e.target.closest('#selBtn')) $('#selBtn').style.display = 'none';
   if (!e.target.closest('#pop') && !e.target.closest('.w') && !e.target.closest('#search')) hidePop();
 });
 
@@ -1223,9 +1322,9 @@ async function loadDrive() {
   btns.forEach(b => b.disabled = true);
   driveMsg('Drive から取得中…');
   try {
-    const d = await (await fetch('/api/drive/fetch', {
+    const d = await api('/api/drive/fetch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ja, en }),
-    })).json();
+    });
     if (d.error) { driveMsg(d.error, true); return; }
     if (d.auth_url) { waitForLogin(d.auth_url); return; }
     const ok = [], ng = [];
@@ -1255,13 +1354,13 @@ async function waitForLogin(url) {
   note.className = 'note small';
   note.innerHTML = `<a class="btn primary" href="${esc(url)}" target="_blank" rel="noopener noreferrer">Google にログインする（新しいタブ）</a>
     　ログインと許可が終わると、自動で読み込みます。`;
-  const before = (await (await fetch('/api/drive/status')).json()).token_time;
+  const before = (await api('/api/drive/status')).token_time;
   clearInterval(loginTimer);
   const started = Date.now();
   loginTimer = setInterval(async () => {
     if (Date.now() - started > 10 * 60 * 1000) { clearInterval(loginTimer); driveMsg('ログインを待つ時間が過ぎました。もう一度「Drive から読み込む」を押してください', true); return; }
     try {
-      const s = await (await fetch('/api/drive/status')).json();
+      const s = await api('/api/drive/status');
       if (s.token_time && s.token_time !== before) { clearInterval(loginTimer); loadDrive(); }
     } catch {}
   }, 2000);
@@ -1271,13 +1370,13 @@ $('#driveReload').addEventListener('click', loadDrive);
 
 async function checkDrive() {
   try {
-    const s = await (await fetch('/api/drive/status')).json();
+    const s = await api('/api/drive/status');
     $('#driveNote').className = 'note small' + (s.libs && s.credentials ? '' : ' warn');
     $('#driveNote').innerHTML = !s.libs
       ? '⚠ Drive 機能を使うには <code>pip install google-auth-oauthlib</code> を実行してサーバーを再起動してください。'
       : !s.credentials
       ? '⚠ <code>credentials.json</code> がありません。README の「Google ドキュメントから読み込む」の手順で用意してください。'
-      : s.authorized ? 'Google アカウントで認証済みです。段落は Google ドキュメントの段落単位で分割されます。'
+      : s.authorized ? 'Google アカウントで認証済みです。段落は Google ドキュメントの段落単位で分割されます。 <button class="btn" id="driveLogout">Google からログアウト</button>'
       : '初回の読み込み時に Google へのログイン用リンクが表示されます。';
   } catch {}
 }
@@ -1314,9 +1413,9 @@ async function loadDoi() {
   const btn = $('#doiLoad'), note = $('#doiNote');
   btn.disabled = true; note.className = 'note small'; note.textContent = '取得中…（本文の取得に十数秒かかることがあります）';
   try {
-    const d = await (await fetch('/api/doi?doi=' + encodeURIComponent(doi))).json();
+    const d = await api('/api/doi?doi=' + encodeURIComponent(doi));
     if (d.error) { note.className = 'note small warn'; note.textContent = '⚠ ' + d.error; return; }
-    note.textContent = '単語をクリックすると辞書を引けます。熟語はドラッグで選択してください。';
+    note.textContent = '単語をクリックすると辞書を引けます。熟語はドラッグで選択して「辞書で調べる」を押してください。';
     store.set('doi', doi); store.set('paper', d);
     renderPaper(d); hidePop();
   } catch (err) {
@@ -1329,6 +1428,16 @@ $('#doiLoad').addEventListener('click', loadDoi);
 $('#doiIn').addEventListener('keydown', e => { if (e.key === 'Enter') loadDoi(); });
 $('#doiIn').value = store.get('doi', '');
 renderPaper(store.get('paper', null));
+
+$('#onlineDict').checked = store.get('online', true);
+$('#onlineDict').addEventListener('change', e => store.set('online', e.target.checked));
+document.addEventListener('click', async e => {
+  if (e.target.id !== 'driveLogout') return;
+  if (!confirm('Google 側の許可を取り消し、この PC に保存したログイン情報を削除します。よろしいですか？')) return;
+  const d = await api('/api/drive/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+  driveMsg(d.revoked ? 'ログアウトしました（Google 側の許可も取り消しました）' : 'ログイン情報を削除しました（Google 側の取り消しは確認できませんでした。Google アカウントの「サードパーティ製のアプリとサービス」から取り消せます）', !d.revoked);
+  checkDrive();
+});
 
 showTab(store.get('tab', 'input'));
 renderWordlist();
@@ -1360,13 +1469,17 @@ def main():
     # ループバックで待ち受けるときは、自分宛ての Host ヘッダー以外を拒否する (None は検査しない)
     loopback = args.host in ("127.0.0.1", "localhost", "::1")
     server.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}"} if loopback else None
+    server.access_key = secrets.token_urlsafe(24)
+    migrate_old_token()
 
     threading.Thread(target=EJ.load, daemon=True).start()
-    url = f"http://{args.host}:{port}/"
+    # キーは URL の # 以降に付ける (サーバーへは送られず、ページが読み取ってアドレス欄から消す)
+    url = f"http://{args.host}:{port}/#key={server.access_key}"
     print(f"翻訳レビューを起動しました: {url}  (Ctrl+C で終了)", flush=True)
+    print("  ※ この URL にはアクセスキーが含まれます。他人に共有しないでください。", flush=True)
     if not loopback:
-        print("警告: 他の PC からもアクセスできる設定です。Google にログイン済みの場合、"
-              "アクセスした人があなたのアカウントで Drive のドキュメントを読めます。", file=sys.stderr)
+        print("警告: 他の PC からもアクセスできる設定です。アクセスキー付きの URL を知っている人は、"
+              "あなたの Google アカウントで Drive のドキュメントを読めます。", file=sys.stderr)
     if not args.no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:

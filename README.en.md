@@ -36,7 +36,9 @@ cd translation-review
 python3 translation_review.py
 ```
 
-Your browser opens `http://127.0.0.1:8000/`. Press `Ctrl+C` to stop the server.
+Your browser opens `http://127.0.0.1:8000/#key=…`. Press `Ctrl+C` to stop the server.
+`#key=…` is an access key that changes on every start (see [Security and privacy](#security-and-privacy)).
+After restarting the server, open the URL printed in the terminal.
 
 | Option | Description |
 |---|---|
@@ -45,8 +47,8 @@ Your browser opens `http://127.0.0.1:8000/`. Press `Ctrl+C` to stop the server.
 | `--no-browser` | Do not open a browser on start |
 
 > [!WARNING]
-> If you change `--host` from the default `127.0.0.1`, anyone on the same network can open the tool.
-> If you are signed in for the Google Docs integration, they could read your Drive documents with your account.
+> If you change `--host` from the default `127.0.0.1`, other computers on the same network can connect.
+> Anyone who learns the URL with the access key could read your Drive documents with your account.
 > Do not change it on networks you do not trust.
 
 On first launch, the English–Japanese dictionary EJDict (about 5 MB) is downloaded into `ejdict/` next to the script.
@@ -64,7 +66,7 @@ After that it is read from disk, so English–Japanese lookups work offline.
    - Tick the checkbox on the right to mark a paragraph as reviewed; progress is shown in the sidebar.
 3. **Look up words**
    - **Click** an English word to open the dictionary; click the same word again to close it.
-   - **Drag to select** a phrase (up to 6 words).
+   - **Drag to select** a phrase (up to 6 words), then press the "辞書で調べる" button that appears. Selecting alone sends nothing.
    - Or type in the search box at the top right and press Enter.
    - Inflected forms are reduced to a base form (e.g. `proposed` → `propose`, `studies` → `study`, `robustness` → `robust`).
 4. **Word list (単語帳)** — Enter the translation used in your paper in the popup and add it to the word list.
@@ -144,12 +146,38 @@ Headings count as paragraphs too, so keep the Japanese and English documents str
 
 ### Notes
 
-- Never share `credentials.json` (your OAuth client) or `token.json` (created after you sign in).
-  Both are excluded from Git by the included `.gitignore`.
-- Delete `token.json` to sign in with a different account.
+- Never share `credentials.json` (your OAuth client) or your sign-in file `token.json`.
+- The sign-in is stored in your home directory at `~/.config/translation-review/token.json` (readable only by you),
+  not in the project folder. A `token.json` left in the project folder by an older version is moved there on start-up.
+- To switch accounts or when you are done, press **"Google からログアウト"** in the input tab.
+  It revokes access on Google's side and then deletes the sign-in file.
 - For "External" apps in testing, the sign-in expires after about 7 days; you will be asked to sign in again.
 - University or company Google Workspace accounts may block third-party apps.
   In that case, create the project inside your organization and choose "Internal", or ask your administrator.
+
+## Security and privacy
+
+The tool handles unpublished manuscripts, so it is built as follows.
+
+**What is sent outside**
+
+| Action | Sent to | What is sent |
+|---|---|---|
+| Clicking a word / "辞書で調べる" | dictionaryapi.dev | That word or phrase only (nothing if you turn off "英英辞書（オンライン）も使う" in the sidebar) |
+| Links in the dictionary popup | Weblio, Eijiro, Cambridge, Google | The word, only when you click a link |
+| Loading from Drive | Google | The IDs of the documents you load |
+| Paper (DOI) mode | OpenAlex, Europe PMC, arXiv | The DOI you enter |
+
+Your manuscript text is never sent out as a whole. The English–Japanese dictionary (EJDict) is searched on your computer.
+
+**Who can use the tool**
+
+- By default the server only listens on `127.0.0.1` (this computer).
+- An **access key** is issued on every start, and the APIs (dictionary, Drive, DOI) only work from a page that has it.
+  This stops other users or programs on the same computer from reading your Drive through your Google sign-in.
+  The key is passed after `#` in the URL, so it never reaches the server logs.
+- Calls from other websites (CSRF, DNS rebinding) and embedding in other sites (clickjacking) are rejected.
+- Google access is read-only (`drive.readonly`); your documents are never modified.
 
 ## Where data is stored
 
@@ -174,6 +202,7 @@ definitions or the external links for those.
 
 - **The dictionary download fails** — Check your network and restart; only the missing files are downloaded again.
   If the python.org build of Python on macOS reports a certificate error, the tool retries with `curl` automatically.
+- **"アクセスキーが無効です" (invalid access key)** — The key changes when the server restarts. Open the `#key=…` URL printed in the terminal.
 - **The port is in use** — The next free port is used. Open the URL that is printed.
 - **The English–Japanese dictionary says it is loading** — Loading takes a few seconds after start-up. Wait and search again.
 - **Drive: "file not found"** — Check the URL and that the signed-in account can view the document.
@@ -189,7 +218,7 @@ README.md / README.en.md
 docs/                   Screenshots
 ejdict/                 English–Japanese dictionary data (created on first launch)
 credentials.json        OAuth client (you add it to use Drive; keep it secret)
-token.json              Google sign-in (created on first sign-in; keep it secret)
+~/.config/translation-review/token.json   Google sign-in (created on first sign-in; keep it secret)
 ```
 
 ## License
