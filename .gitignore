@@ -1,0 +1,16 @@
+# Google OAuth の秘密情報 (絶対にコミットしない)
+credentials.json
+client_secret*.json
+token.json
+
+# 初回起動時に自動ダウンロードされる辞書データ
+ejdict/
+
+# 実行時に生成されるファイル
+server.log
+wordlist.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
