@@ -14,6 +14,7 @@ LLM などで英訳した原稿を、著者自身が 1 段落ずつ確認する�
 - **単語帳** — 論文で意図した訳（例: calibrate → 校正する）をメモし、CSV で書き出し
 - **前の版との差分** — 原稿を読み直したときの変更箇所を、追加は緑・削除は赤で表示
 - **Google ドキュメント連携** — 非公開のままの Google ドキュメントから原稿を直接読み込み（任意）
+- **論文 (DOI) モード** — DOI を入れると、その論文の英文を表示し、同じ辞書・単語帳で読める
 - Python 標準ライブラリだけで動作（Google 連携を使う場合のみ追加ライブラリが必要）
 
 ![辞書ポップアップ: 英和・英英の意味と単語帳への登録](docs/screenshot-dictionary.png)
@@ -69,6 +70,23 @@ python3 translation_review.py
    - 「CSV 出力」で `wordlist.csv`（Excel で文字化けしない BOM 付き UTF-8）を保存できます。
 
 `Esc` キーでポップアップを閉じます。
+
+## 論文 (DOI) モード
+
+「論文 (DOI)」タブで DOI（`10.1038/…` や `https://doi.org/…`）を入れて「英文を表示」を押すと、その論文の英文を表示します。
+原稿と同じく、単語のクリックで辞書を引き、単語帳に登録できます。他の論文で使われている表現を調べるときに便利です。
+
+無料・登録不要の API だけを使い、取得できる範囲を次の順で探します。
+
+| 論文の種類 | 表示する内容 | 取得元 |
+|---|---|---|
+| PubMed Central に収録（生命科学系、一部の Nature 論文など） | 本文（出版版） | [Europe PMC](https://europepmc.org/) |
+| arXiv 版がある（物理・数学・情報系など） | 本文（プレプリント版。出版版と異なる場合あり） | [arXiv](https://arxiv.org/) の HTML 版 |
+| 上記以外（購読が必要な論文など） | 題名と要旨のみ | [OpenAlex](https://openalex.org/) |
+
+- 出版社のサイトから本文を抜き出すことはしません。本文が必要な場合は、表示される DOI のリンクから開いてください。
+- 数式は TeX の形で灰色の枠に表示し、辞書の対象から外します。図表は表示しません。
+- 和訳の表示は行いません（無料で行える手段がないため）。
 
 ## 前の版との差分
 
@@ -175,4 +193,4 @@ token.json              Google ログイン情報（初回ログイン時に自�
 [MIT License](LICENSE)
 
 英和辞書データ [EJDict-hand](https://github.com/kujirahand/EJDict)（CC0）は本リポジトリには含まれず、初回起動時に取得します。
-英英辞書には [Free Dictionary API](https://dictionaryapi.dev/) を利用しています。
+英英辞書には [Free Dictionary API](https://dictionaryapi.dev/)、論文 (DOI) モードには [OpenAlex](https://openalex.org/)・[Europe PMC](https://europepmc.org/)・[arXiv](https://arxiv.org/) の API を利用しています。

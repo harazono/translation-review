@@ -31,6 +31,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from html import escape as html_escape
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -328,6 +329,217 @@ def drive_fetch(refs, port):
 
 
 # ---------------------------------------------------------------------------
+# DOI から論文の英文を取得 (無料・キー不要の API のみ)
+#   メタデータと要旨: OpenAlex / 本文: Europe PMC (PMC 収録論文), arXiv HTML 版
+#   本文が無料で手に入らない論文は要旨だけを返す
+# ---------------------------------------------------------------------------
+OPENALEX_URL = "https://api.openalex.org/works/doi:{}"
+EUROPEPMC_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/{}/fullTextXML"
+ARXIV_HTML_URL = "https://arxiv.org/html/{}"
+DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
+ARXIV_ID_RE = re.compile(r"arxiv\.org/abs/([\w.\-/]+?)(?:v\d+)?$|^10\.48550/arxiv\.(.+)$", re.I)
+_doi_cache = {}
+MATH_OPEN, MATH_CLOSE = "\ue000", "\ue001"  # 数式の目印 (画面側で本文と区別して表示する)
+
+
+class DoiError(Exception):
+    pass
+
+
+def _clean(text):
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_doi(raw):
+    doi = raw.strip()
+    doi = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", doi, flags=re.I)
+    doi = urllib.parse.unquote(doi).strip()
+    if not DOI_RE.match(doi):
+        raise DoiError("DOI として認識できません（例: 10.1038/s41586-020-2649-2）")
+    return doi
+
+
+def _abstract_from_index(inv):
+    """OpenAlex の abstract_inverted_index ({単語: [位置, ...]}) から要旨を復元する。"""
+    if not inv:
+        return ""
+    pos = {i: w for w, idxs in inv.items() for i in idxs}
+    return " ".join(pos[i] for i in sorted(pos))
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+
+def _jats_text(el):
+    """JATS XML の要素からテキストを取り出す (図表は除き、数式は TeX があればそれを使う)。"""
+    parts = [el.text or ""]
+    for child in el:
+        name = _local(child.tag)
+        if name in ("table-wrap", "fig", "supplementary-material", "fn"):
+            pass
+        elif name in ("inline-formula", "disp-formula"):
+            tex = next((c.text for c in child.iter() if _local(c.tag) == "tex-math" and c.text), None)
+            if tex:  # PMC の TeX は \documentclass ... \begin{document} $x$ \end{document} の形のことがある
+                m = re.search(r"\\begin\{document\}(.*)\\end\{document\}", tex, re.S)
+                tex = (m.group(1) if m else tex).strip().strip("$").strip()
+            parts.append(f" {MATH_OPEN}{tex}{MATH_CLOSE} " if tex else " [式] ")
+        else:
+            parts.append(_jats_text(child))
+        parts.append(child.tail or "")
+    return "".join(parts)
+
+
+def parse_jats(xml_bytes):
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_bytes)
+    sections = []
+    abstract = next((e for e in root.iter() if _local(e.tag) == "abstract"), None)
+    if abstract is not None:
+        paras = [_clean(_jats_text(p)) for p in abstract.iter() if _local(p.tag) == "p"]
+        if paras:
+            sections.append({"heading": "Abstract", "paragraphs": paras})
+
+    def walk(sec, prefix):
+        title = next((c for c in sec if _local(c.tag) == "title"), None)
+        heading = _clean(_jats_text(title)) if title is not None else ""
+        paras = [_clean(_jats_text(c)) for c in sec if _local(c.tag) == "p"]
+        if heading or paras:
+            sections.append({"heading": heading, "paragraphs": [x for x in paras if x]})
+        for c in sec:
+            if _local(c.tag) == "sec":
+                walk(c, prefix)
+
+    body = next((e for e in root.iter() if _local(e.tag) == "body"), None)
+    if body is not None:
+        loose = [_clean(_jats_text(c)) for c in body if _local(c.tag) == "p"]
+        if loose:
+            sections.append({"heading": "", "paragraphs": loose})
+        for c in body:
+            if _local(c.tag) == "sec":
+                walk(c, "")
+    return sections
+
+
+class _ArxivHTMLParser(HTMLParser):
+    """arXiv の HTML 版 (LaTeXML 出力) から見出しと段落のテキストを取り出す。"""
+    VOID = {"br", "img", "input", "meta", "link", "hr", "source", "col", "wbr", "area", "base", "embed", "track"}
+    SKIP_CLASSES = ("ltx_figure", "ltx_table", "ltx_note", "ltx_bibliography", "ltx_float", "ltx_listing")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.sections = [{"heading": "", "paragraphs": []}]
+        self.stack = []
+        self.skip_depth = None     # この深さの要素が閉じるまで読み飛ばす
+        self.capture = None        # ("heading" | "para", 深さ)
+        self.buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.VOID:
+            return
+        a = dict(attrs)
+        cls = a.get("class") or ""
+        self.stack.append(tag)
+        depth = len(self.stack)
+        if self.skip_depth is not None:
+            return
+        if tag in ("figure", "table", "nav", "header", "footer", "script", "style") or any(c in cls for c in self.SKIP_CLASSES):
+            self.skip_depth = depth
+        elif tag == "math":
+            if self.capture:
+                self.buf.append(f" {MATH_OPEN}{a.get('alttext', '')}{MATH_CLOSE} ")
+            self.skip_depth = depth
+        elif self.capture is None and re.fullmatch(r"h[1-6]", tag) and "ltx_title" in cls:
+            self.capture, self.buf = ("heading", depth), []
+        elif self.capture is None and tag == "p" and "ltx_p" in cls:
+            self.capture, self.buf = ("para", depth), []
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID or tag not in self.stack:
+            return
+        while self.stack:
+            depth = len(self.stack)
+            closed = self.stack.pop()
+            if self.skip_depth is not None and depth <= self.skip_depth:
+                self.skip_depth = None
+            if self.capture and depth <= self.capture[1]:
+                text = _clean("".join(self.buf))
+                if text:
+                    if self.capture[0] == "heading":
+                        self.sections.append({"heading": text, "paragraphs": []})
+                    else:
+                        self.sections[-1]["paragraphs"].append(text)
+                self.capture = None
+            if closed == tag:
+                break
+
+    def handle_data(self, data):
+        if self.capture and self.skip_depth is None:
+            self.buf.append(data)
+
+
+def parse_arxiv_html(html_bytes):
+    parser = _ArxivHTMLParser()
+    parser.feed(html_bytes.decode("utf-8", errors="replace"))
+    return [s for s in parser.sections if s["paragraphs"]]
+
+
+def lookup_doi(raw):
+    doi = normalize_doi(raw)
+    if doi.lower() in _doi_cache:
+        return _doi_cache[doi.lower()]
+    try:
+        work = json.loads(fetch(OPENALEX_URL.format(urllib.parse.quote(doi, safe="/")), timeout=20))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise DoiError("この DOI の論文が見つかりませんでした（OpenAlex 未収録の可能性があります）") from e
+        raise DoiError(f"論文情報の取得に失敗しました (HTTP {e.code})") from e
+
+    authors = [a.get("author", {}).get("display_name", "") for a in work.get("authorships", [])]
+    source = ((work.get("primary_location") or {}).get("source") or {}).get("display_name", "")
+    result = {
+        "doi": doi,
+        "title": _clean(work.get("title") or work.get("display_name") or ""),
+        "authors": authors[:8] + (["ほか"] if len(authors) > 8 else []),
+        "venue": source,
+        "year": work.get("publication_year"),
+        "source": "abstract",
+        "sections": [],
+    }
+
+    # 1) PubMed Central に収録されていれば Europe PMC から本文 (出版版)
+    pmcid = re.search(r"(\d+)\s*$", (work.get("ids") or {}).get("pmcid") or "")
+    if pmcid:
+        try:
+            secs = parse_jats(fetch(EUROPEPMC_URL.format("PMC" + pmcid.group(1)), timeout=30))
+            if sum(len(s["paragraphs"]) for s in secs) > 1:
+                result.update(source="europepmc", sections=secs)
+        except Exception:  # noqa: BLE001  (本文が無い・取得失敗なら次の手段へ)
+            pass
+
+    # 2) arXiv 版があれば arXiv の HTML 版から本文 (プレプリント版)
+    if result["source"] == "abstract":
+        cands = [doi] + [l.get("landing_page_url") or "" for l in work.get("locations", [])]
+        arxiv_id = next((m.group(1) or m.group(2) for c in cands if (m := ARXIV_ID_RE.search(c))), None)
+        if arxiv_id:
+            try:
+                secs = parse_arxiv_html(fetch(ARXIV_HTML_URL.format(arxiv_id), timeout=30))
+                if sum(len(s["paragraphs"]) for s in secs) > 1:
+                    result.update(source="arxiv", arxiv_id=arxiv_id, sections=secs)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # 3) どちらも無ければ OpenAlex の要旨だけ
+    if result["source"] == "abstract":
+        abstract = _abstract_from_index(work.get("abstract_inverted_index"))
+        if abstract:
+            result["sections"] = [{"heading": "Abstract", "paragraphs": [abstract]}]
+
+    _doi_cache[doi.lower()] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
 # HTTP サーバー
 # ---------------------------------------------------------------------------
 MAX_BODY = 1 << 20  # POST 本文の上限 (1MB)
@@ -379,6 +591,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, b'{"error":"empty"}', "application/json")
                 return
             self._json(lookup(q))
+        elif url.path == "/api/doi":
+            try:
+                self._json(lookup_doi(params.get("doi", "")))
+            except DoiError as e:
+                self._json({"error": str(e)})
+            except Exception as e:  # noqa: BLE001
+                self._json({"error": f"論文の取得に失敗しました: {e}"})
         elif url.path == "/api/drive/status":
             self._json(drive_status())
         else:
@@ -499,6 +718,25 @@ PAGE = r"""<!doctype html>
   tr.changed td.num { box-shadow: inset 3px 0 0 #e0a800; }
   tr.filtered { display: none; }
   td.en { font-family: Charter, "Iowan Old Style", Georgia, serif; font-size: 16px; }
+
+  /* 論文 (DOI) タブ */
+  .doibar { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center;
+            background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px; }
+  .doibar input { font: inherit; font-size: 13px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
+  .doibar .note { grid-column: 1 / -1; }
+  .doibar .note.warn { color: var(--warn); }
+  #paper { max-width: 760px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+           padding: 28px 36px; font-family: Charter, "Iowan Old Style", Georgia, serif; font-size: 17px; line-height: 1.75; }
+  #paper:empty { display: none; }
+  #paper h2 { font-size: 24px; line-height: 1.35; margin: 0 0 8px; }
+  #paper h3 { font-size: 18px; margin: 28px 0 6px; }
+  #paper p { margin: 0 0 14px; }
+  #paper .meta { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; font-size: 13px; color: var(--muted); }
+  #paper .meta a { color: var(--accent); }
+  #paper .srcnote { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; font-size: 13px;
+                    background: var(--accent-soft); border-radius: 6px; padding: 6px 10px; margin: 12px 0 8px; }
+  #paper .srcnote.warn { background: var(--hl); }
+  .math { font-family: ui-monospace, Menlo, monospace; font-size: 13px; color: var(--muted); background: #f3f3f0; padding: 0 3px; border-radius: 3px; }
   .w { cursor: pointer; border-radius: 3px; }
   .w.active { background: var(--accent-soft); outline: 1px solid var(--accent); }
   .w:hover { background: var(--accent-soft); }
@@ -542,8 +780,8 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <h1>翻訳レビュー</h1>
-  <div class="tabs"><button data-tab="input">入力</button><button data-tab="compare">比較</button></div>
-  <label class="small">分割:
+  <div class="tabs"><button data-tab="input">入力</button><button data-tab="compare">比較</button><button data-tab="doi">論文 (DOI)</button></div>
+  <label class="small" id="splitWrap">分割:
     <select id="split">
       <option value="para">空行で段落分割</option>
       <option value="line">1行ずつ</option>
@@ -589,6 +827,15 @@ PAGE = r"""<!doctype html>
         <thead><tr><th class="num">#</th><th>日本語</th><th>English</th><th class="chk" title="確認済み">✓</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
+    </section>
+    <section id="tab-doi" class="hidden">
+      <div class="doibar">
+        <b class="small">DOI</b>
+        <input id="doiIn" placeholder="10.1038/s41586-020-2649-2 または https://doi.org/…">
+        <button class="btn primary" id="doiLoad">英文を表示</button>
+        <div class="note small" id="doiNote">オープンアクセスの論文は本文を、それ以外は要旨を表示します。単語のクリックで辞書を引けます。</div>
+      </div>
+      <article id="paper"></article>
     </section>
   </div>
   <aside>
@@ -637,8 +884,9 @@ for (const [inp, ta] of [['#fileJa', '#ja'], ['#fileEn', '#en']]) {
 // ---------- タブ ----------
 function showTab(name) {
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
-  $('#tab-input').classList.toggle('hidden', name !== 'input');
-  $('#tab-compare').classList.toggle('hidden', name !== 'compare');
+  for (const t of ['input', 'compare', 'doi']) $('#tab-' + t).classList.toggle('hidden', name !== t);
+  $('#splitWrap').classList.toggle('hidden', name === 'doi');
+  $('#status').classList.toggle('hidden', name === 'doi');
   store.set('tab', name);
   if (name === 'compare') render();
   hidePop();
@@ -811,22 +1059,25 @@ function countParas() {
 // ---------- 辞書 ----------
 // 単語クリックで辞書を開き、同じ単語をもう一度クリックで閉じる
 let popAnchor = null;
-$('#rows').addEventListener('click', e => {
-  const w = e.target.closest('.w');
-  if (!w || e.detail > 1 || !window.getSelection().isCollapsed) return;
-  if (popAnchor === w && $('#pop').style.display === 'block') hidePop();
-  else lookup(w.textContent, w);
-});
-$('#rows').addEventListener('mouseup', e => {
-  if (!e.target.closest('td.en')) return;
-  setTimeout(() => {
-    const sel = window.getSelection(); const t = sel.toString().trim();
-    if (!t || sel.isCollapsed || e.detail > 1) return;
-    if (!/^[A-Za-z][A-Za-z'’\- ]*$/.test(t) || t.split(/\s+/).length > 6) return;
-    const r = sel.getRangeAt(0).getBoundingClientRect();
-    lookup(t, null, r);
-  }, 0);
-});
+// 比較タブの英文と、論文 (DOI) タブの本文で同じ操作を使う
+for (const area of [$('#rows'), $('#paper')]) {
+  area.addEventListener('click', e => {
+    const w = e.target.closest('.w');
+    if (!w || e.detail > 1 || !window.getSelection().isCollapsed) return;
+    if (popAnchor === w && $('#pop').style.display === 'block') hidePop();
+    else lookup(w.textContent, w);
+  });
+  area.addEventListener('mouseup', e => {
+    if (!e.target.closest('td.en, #paper')) return;
+    setTimeout(() => {
+      const sel = window.getSelection(); const t = sel.toString().trim();
+      if (!t || sel.isCollapsed || e.detail > 1) return;
+      if (!/^[A-Za-z][A-Za-z'’\- ]*$/.test(t) || t.split(/\s+/).length > 6) return;
+      const r = sel.getRangeAt(0).getBoundingClientRect();
+      lookup(t, null, r);
+    }, 0);
+  });
+}
 $('#search').addEventListener('keydown', e => {
   if (e.key === 'Enter' && e.target.value.trim()) lookup(e.target.value.trim(), e.target);
 });
@@ -911,7 +1162,7 @@ document.addEventListener('mousedown', e => {
 // ---------- 単語帳 ----------
 function occurrences(k) { return document.querySelectorAll(`#rows .w[data-k="${CSS.escape(k)}"]`).length; }
 function markSaved() {
-  document.querySelectorAll('#rows .w').forEach(s => s.classList.toggle('saved', !!words[s.dataset.k]));
+  document.querySelectorAll('.w').forEach(s => s.classList.toggle('saved', !!words[s.dataset.k]));
 }
 function renderWordlist() {
   const list = Object.entries(words).sort((a, b) => a[0].localeCompare(b[0]));
@@ -1030,6 +1281,54 @@ async function checkDrive() {
       : '初回の読み込み時に Google へのログイン用リンクが表示されます。';
   } catch {}
 }
+
+// ---------- 論文 (DOI) ----------
+const SOURCE_NOTE = {
+  europepmc: ['本文: Europe PMC（PubMed Central 収録の出版版）', ''],
+  arxiv: ['本文: arXiv の HTML 版（プレプリント）。出版版と内容が異なる場合があります', 'warn'],
+  abstract: ['本文は無料で取得できないため、要旨のみを表示しています（OpenAlex）', 'warn'],
+};
+// 本文中の数式 (… で囲まれた部分) は辞書の対象にせず、そのまま表示する
+function paperText(t) {
+  return t.split(/([^]*)/).map(seg =>
+    seg.startsWith('') ? `<span class="math">${esc(seg.slice(1, -1))}</span>` : wrapWords(seg)).join('');
+}
+function renderPaper(d) {
+  if (!d) { $('#paper').innerHTML = ''; return; }
+  const [note, cls] = SOURCE_NOTE[d.source] || ['', ''];
+  const meta = [d.authors.join(', '), [d.venue, d.year].filter(Boolean).join(', ')].filter(Boolean).join(' — ');
+  let h = `<h2>${esc(d.title)}</h2><div class="meta">${esc(meta)}<br>
+    <a href="https://doi.org/${esc(d.doi)}" target="_blank" rel="noopener noreferrer">doi:${esc(d.doi)}</a>
+    ${d.arxiv_id ? ` · <a href="https://arxiv.org/abs/${esc(d.arxiv_id)}" target="_blank" rel="noopener noreferrer">arXiv:${esc(d.arxiv_id)}</a>` : ''}</div>
+    <div class="srcnote ${cls}">${esc(note)}</div>`;
+  if (!d.sections.length) h += '<p class="small">要旨も登録されていませんでした。DOI のリンクから出版社のページを開いてください。</p>';
+  for (const s of d.sections) {
+    if (s.heading) h += `<h3>${paperText(s.heading)}</h3>`;
+    h += s.paragraphs.map(p => `<p>${paperText(p)}</p>`).join('');
+  }
+  $('#paper').innerHTML = h;
+}
+async function loadDoi() {
+  const doi = $('#doiIn').value.trim();
+  if (!doi) return;
+  const btn = $('#doiLoad'), note = $('#doiNote');
+  btn.disabled = true; note.className = 'note small'; note.textContent = '取得中…（本文の取得に十数秒かかることがあります）';
+  try {
+    const d = await (await fetch('/api/doi?doi=' + encodeURIComponent(doi))).json();
+    if (d.error) { note.className = 'note small warn'; note.textContent = '⚠ ' + d.error; return; }
+    note.textContent = '単語をクリックすると辞書を引けます。熟語はドラッグで選択してください。';
+    store.set('doi', doi); store.set('paper', d);
+    renderPaper(d); hidePop();
+  } catch (err) {
+    note.className = 'note small warn'; note.textContent = '⚠ 取得に失敗しました: ' + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('#doiLoad').addEventListener('click', loadDoi);
+$('#doiIn').addEventListener('keydown', e => { if (e.key === 'Enter') loadDoi(); });
+$('#doiIn').value = store.get('doi', '');
+renderPaper(store.get('paper', null));
 
 showTab(store.get('tab', 'input'));
 renderWordlist();

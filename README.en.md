@@ -16,6 +16,7 @@ It is meant for authors who translate their manuscript with an LLM or similar to
 - **Word list** — Note the translation you intend for each term (e.g. calibrate → 校正する) and export it as CSV.
 - **Diff against the previous version** — When you reload the drafts, additions are shown in green and deletions in red.
 - **Google Docs integration** — Load drafts directly from private Google Docs (optional).
+- **Paper (DOI) mode** — Enter a DOI to read that paper's English text with the same dictionary and word list.
 - Runs on the Python standard library alone; only the Google Docs integration needs an extra package.
 
 ![Dictionary popup with English–Japanese and English–English definitions](docs/screenshot-dictionary.png)
@@ -72,6 +73,23 @@ After that it is read from disk, so English–Japanese lookups work offline.
    - "CSV 出力" saves `wordlist.csv` (UTF-8 with BOM, so Excel opens it correctly).
 
 Press `Esc` to close the popup.
+
+## Paper (DOI) mode
+
+In the "論文 (DOI)" tab, enter a DOI (`10.1038/…` or `https://doi.org/…`) and click "英文を表示" to display the paper's English text.
+As with your draft, click words to look them up and add them to the word list — handy for checking how other papers phrase things.
+
+Only free APIs that need no registration are used, tried in this order:
+
+| Paper | What is shown | Source |
+|---|---|---|
+| In PubMed Central (life sciences, some Nature papers, etc.) | Full text (published version) | [Europe PMC](https://europepmc.org/) |
+| Has an arXiv version (physics, math, CS, etc.) | Full text (preprint; may differ from the published version) | HTML version on [arXiv](https://arxiv.org/) |
+| Anything else (e.g. subscription papers) | Title and abstract only | [OpenAlex](https://openalex.org/) |
+
+- Full text is never scraped from publisher websites. Use the DOI link shown to open the publisher's page.
+- Math is shown as TeX in a grey box and excluded from dictionary lookup. Figures and tables are not shown.
+- No Japanese translation is shown (there is no free way to provide one).
 
 ## Diff against the previous version
 
@@ -179,4 +197,4 @@ token.json              Google sign-in (created on first sign-in; keep it secret
 [MIT License](LICENSE)
 
 The English–Japanese dictionary data [EJDict-hand](https://github.com/kujirahand/EJDict) (CC0) is not included in this
-repository; it is downloaded on first launch. English–English definitions come from the [Free Dictionary API](https://dictionaryapi.dev/).
+repository; it is downloaded on first launch. English–English definitions come from the [Free Dictionary API](https://dictionaryapi.dev/); the paper (DOI) mode uses the [OpenAlex](https://openalex.org/), [Europe PMC](https://europepmc.org/) and [arXiv](https://arxiv.org/) APIs.
